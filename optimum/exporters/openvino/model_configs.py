@@ -143,6 +143,7 @@ from .model_patcher import (
     SanaTextEncoderModelPatcher,
     XverseModelPatcher,
     Zamba2ModelPatcher,
+    ParaformerModelPatcher,
 )
 
 
@@ -4510,3 +4511,93 @@ class GraniteMoeHybridOpenVINOConfig(MambaOpenVINOConfig):
         if self.use_past_in_inputs:
             self.add_past_key_values(common_inputs, direction="inputs")
         return common_inputs
+
+
+# ============================================================================
+# Paraformer ASR Model Support
+# ============================================================================
+# Registration for FunASR Paraformer models for automatic speech recognition
+# This allows export via: optimum-cli export openvino --model funasr/paraformer-zh
+
+try:
+    from .modeling_paraformer import (
+        ParaformerForASR,
+        ParaformerConfig,
+        _load_paraformer_model,
+    )
+
+    if "paraformer" not in TasksManager._LIBRARY_TO_SUPPORTED_MODEL_TYPES:
+        TasksManager._LIBRARY_TO_SUPPORTED_MODEL_TYPES["paraformer"] = {
+            "paraformer": {
+                "automatic-speech-recognition": ("ParaformerForASR",),
+            }
+        }
+
+    if "paraformer" not in TasksManager._LIBRARY_TO_TASKS_TO_MODEL_LOADER_MAP:
+        TasksManager._LIBRARY_TO_TASKS_TO_MODEL_LOADER_MAP["paraformer"] = {
+            "automatic-speech-recognition": _load_paraformer_model,
+        }
+
+    TasksManager._CUSTOM_CLASSES[("pt", "paraformer", "automatic-speech-recognition")] = (
+        "optimum.exporters.openvino.modeling_paraformer",
+        "ParaformerForASR",
+    )
+
+    PARAFORMER_AVAILABLE = True
+except ImportError:
+    PARAFORMER_AVAILABLE = False
+    logger.debug("Paraformer support not available - modeling_paraformer module not found")
+
+try:
+    from .paraformer_plugin import initialize_paraformer_support
+    initialize_paraformer_support()
+except ImportError:
+    pass
+
+
+class ParaformerDummyAudioInputGenerator(DummyInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("speech", "speech_lengths")
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "speech":
+            batch_size = self.batch_size
+            return self.random_float_tensor(
+                shape=(batch_size, 30, 560),
+                min_value=-1.0,
+                max_value=1.0,
+                framework=framework,
+                dtype=float_dtype
+            )
+        elif input_name == "speech_lengths":
+            return self.random_int_tensor(
+                shape=(self.batch_size,),
+                max_value=30,
+                min_value=6,
+                framework=framework,
+                dtype="int32"
+            )
+
+
+@register_in_tasks_manager(
+    "paraformer",
+    *["automatic-speech-recognition"],
+    library_name="transformers",
+)
+class ParaformerOpenVINOConfig(OnnxConfig):
+    DEFAULT_ONNX_OPSET = 14
+    DUMMY_INPUT_GENERATOR_CLASSES = (ParaformerDummyAudioInputGenerator,)
+    _MODEL_PATCHER = ParaformerModelPatcher
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "speech": {0: "batch_size", 1: "feats_length"},
+            "speech_lengths": {0: "batch_size"},
+        }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "logits": {0: "batch_size", 1: "logits_length"},
+            "token_num": {0: "batch_size"},
+        }

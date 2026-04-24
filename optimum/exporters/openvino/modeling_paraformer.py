@@ -1,14 +1,33 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import logging
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Union
+from pathlib import Path
 import numpy as np
 import types
 import math
 import os
 import json
 import copy
-from omegaconf import OmegaConf, DictConfig, ListConfig
+
+# Optional dependency: omegaconf is only required for loading FunASR-style configs
+try:
+    from omegaconf import OmegaConf, DictConfig, ListConfig
+    _OMEGACONF_AVAILABLE = True
+except ImportError:
+    OmegaConf = None
+    DictConfig = None
+    ListConfig = None
+    _OMEGACONF_AVAILABLE = False
+
+# Optional dependency: loralib for LoRA fine-tuning
+try:
+    import loralib as lora
+    _LORA_AVAILABLE = True
+except ImportError:
+    lora = None
+    _LORA_AVAILABLE = False
 
 # Copied from https://github.com/modelscope/FunASR/blob/main/funasr/models/transformer/utils/repeat.py#L14 (Apache 2.0)
 class MultiSequential(torch.nn.Sequential):
@@ -73,15 +92,15 @@ class PositionwiseFeedForward(torch.nn.Module):
 class StreamSinusoidalPositionEncoder(torch.nn.Module):
     """ """
 
-    def __int__(self, d_model=80, dropout_rate=0.1):
-        pass
+    def __init__(self, d_model=80, dropout_rate=0.1):
+        super().__init__()
 
 # Copied from https://github.com/modelscope/FunASR/blob/main/funasr/models/transformer/embedding.py#L383 (Apache 2.0)
 class SinusoidalPositionEncoder(torch.nn.Module):
     """ """
 
-    def __int__(self, d_model=80, dropout_rate=0.1):
-        pass
+    def __init__(self, d_model=80, dropout_rate=0.1):
+        super().__init__()
 
     def encode(
         self, positions: torch.Tensor = None, depth: int = None, dtype: torch.dtype = torch.float32
@@ -104,7 +123,7 @@ class SinusoidalPositionEncoder(torch.nn.Module):
 
     def forward(self, x):
         batch_size, timesteps, input_dim = x.size()
-        positions = torch.arange(1, timesteps + 1, device=x.device)[None, :]
+        positions = torch.arange(1, timesteps + 1, dtype=torch.int32, device=x.device)[None, :]
         position_encoding = self.encode(positions, input_dim, x.dtype).to(x.device)
 
         return x + position_encoding
@@ -259,8 +278,8 @@ class sequence_mask(nn.Module):
     def forward(self, lengths, max_seq_len=None, dtype=torch.float32, device=None):
         if max_seq_len is None:
             max_seq_len = lengths.max()
-        row_vector = torch.arange(0, max_seq_len, 1).to(lengths.device)
-        matrix = torch.unsqueeze(lengths, dim=-1)
+        row_vector = torch.arange(0, max_seq_len, 1, dtype=torch.int32, device=lengths.device)
+        matrix = torch.unsqueeze(lengths, dim=-1).to(torch.int32)
         mask = row_vector < matrix
 
         return mask.type(dtype).to(device) if device is not None else mask.type(dtype)
@@ -318,6 +337,11 @@ class MultiHeadedAttentionSANM(nn.Module):
         # self.linear_k = nn.Linear(n_feat, n_feat)
         # self.linear_v = nn.Linear(n_feat, n_feat)
         if lora_list is not None:
+            if not _LORA_AVAILABLE:
+                raise ImportError(
+                    "LoRA layers require the 'loralib' package. "
+                    "Please install it with: pip install loralib"
+                )
             if "o" in lora_list:
                 self.linear_out = lora.Linear(
                     n_feat, n_feat, r=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout
@@ -1224,8 +1248,12 @@ class SANMEncoderExport(nn.Module):
     def forward(self, speech: torch.Tensor, speech_lengths: torch.Tensor, online: bool = False):
         if not online:
             speech = speech * self._output_size**0.5
-
-        mask = self.make_pad_mask(speech_lengths)
+        batch_size, seq_len, feat_dim = speech.shape
+        # Create range [0, 1, 2, ..., seq_len-1] that's shape-dependent, not value-dependent
+        arange = torch.arange(seq_len, dtype=torch.int32, device=speech.device).unsqueeze(0).expand(batch_size, -1)
+        lengths_expanded = speech_lengths.unsqueeze(1).to(torch.int32)
+        # Mask where position < length (convert bool to float for prepare_mask)
+        mask = (arange < lengths_expanded).to(torch.float32)
         mask = self.prepare_mask(mask)
         if self.embed is None:
             xs_pad = speech
@@ -1512,12 +1540,17 @@ class ParaformerSANMDecoderExport(torch.nn.Module):
     ):
 
         tgt = ys_in_pad
-        tgt_mask = self.make_pad_mask(ys_in_lens)
+        batch_size = tgt.shape[0]
+        tgt_seq_len = tgt.shape[1]
+        arange_tgt = torch.arange(tgt_seq_len, dtype=torch.int32, device=tgt.device).unsqueeze(0).expand(batch_size, -1)
+        tgt_mask = (arange_tgt < ys_in_lens.unsqueeze(1).to(torch.int32)).to(torch.float32)
         tgt_mask, _ = self.prepare_mask(tgt_mask)
         # tgt_mask = myutils.sequence_mask(ys_in_lens, device=tgt.device)[:, :, None]
 
         memory = hs_pad
-        memory_mask = self.make_pad_mask(hlens)
+        mem_seq_len = memory.shape[1]
+        arange_mem = torch.arange(mem_seq_len, dtype=torch.int32, device=memory.device).unsqueeze(0).expand(batch_size, -1)
+        memory_mask = (arange_mem < hlens.unsqueeze(1).to(torch.int32)).to(torch.float32)
         _, memory_mask = self.prepare_mask(memory_mask)
         # memory_mask = myutils.sequence_mask(hlens, device=memory.device)[:, None, :]
 
@@ -1755,12 +1788,12 @@ def cif_v1_export(hidden, alphas, threshold: float):
 
     # max_label_len = batch_len.max()
     max_label_len = alphas.sum(dim=-1)
-    max_label_len = torch.floor(max_label_len).max().to(dtype=torch.int64)
+    max_label_len = torch.floor(max_label_len).max().to(dtype=torch.int32)
 
     # frame_fires = torch.zeros(batch_size, max_label_len, hidden_size, dtype=dtype, device=device)
     frame_fires = torch.zeros(batch_size, max_label_len, hidden_size, dtype=dtype, device=device)
-    indices = torch.arange(max_label_len, device=device).expand(batch_size, -1)
-    frame_fires_idxs = indices < batch_len.unsqueeze(1)
+    indices = torch.arange(max_label_len, dtype=torch.int32, device=device).expand(batch_size, -1)
+    frame_fires_idxs = indices < batch_len.unsqueeze(1).to(torch.int32)
     frame_fires[frame_fires_idxs] = frames
     return frame_fires, fires
 
@@ -1812,7 +1845,20 @@ class Paraformer(torch.nn.Module):
     ):
 
         super().__init__()
-        encoder = SANMEncoder(input_size=input_size, **encoder_conf)
+        # Filter out streaming-specific parameters not supported by SANMEncoder
+        sanm_encoder_params = {
+            'input_size', 'output_size', 'attention_heads', 'linear_units', 
+            'num_blocks', 'dropout_rate', 'positional_dropout_rate', 
+            'attention_dropout_rate', 'input_layer', 'pos_enc_class', 
+            'normalize_before', 'concat_after', 'positionwise_layer_type', 
+            'positionwise_conv_kernel_size', 'padding_idx', 'interctc_layer_idx',
+            'interctc_use_conditioning', 'kernel_size', 'sanm_shfit', 
+            'lora_list', 'lora_rank', 'lora_alpha', 'lora_dropout',
+            'selfattention_layer_type', 'tf2torch_tensor_name_prefix_torch',
+            'tf2torch_tensor_name_prefix_tf'
+        }
+        filtered_encoder_conf = {k: v for k, v in encoder_conf.items() if k in sanm_encoder_params}
+        encoder = SANMEncoder(input_size=input_size, **filtered_encoder_conf)
         encoder_output_size = encoder.output_size()
 
         if decoder is not None:
@@ -1897,6 +1943,11 @@ def get_or_download_model_dir_hf(
     return model_cache_dir
 
 def download_from_hf(**kwargs):
+    if not _OMEGACONF_AVAILABLE:
+        raise ImportError(
+            "omegaconf is required for loading FunASR/Paraformer model configs. "
+            "Install it with: pip install omegaconf"
+        )
     model_or_path = kwargs.get("model")
     model_revision = kwargs.get("model_revision", "master")
     if not os.path.exists(model_or_path) and "model_path" not in kwargs:
@@ -2103,3 +2154,168 @@ def export(model, kwargs, input=None, **cfg):
         export_dir, model_jit_scripts = export_utils(model=model, **kwargs)
 
     return export_dir, model_jit_scripts
+
+
+# ============================================================================
+# Transformers-compatible wrappers for Paraformer models
+# ============================================================================
+# These classes provide compatibility with the optimum-intel export pipeline
+
+try:
+    from transformers import PretrainedConfig, PreTrainedModel
+    _TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    _TRANSFORMERS_AVAILABLE = False
+    PretrainedConfig = object
+    PreTrainedModel = object
+
+
+class ParaformerConfig(PretrainedConfig):
+    """
+    Configuration class for Paraformer ASR models.
+    
+    This provides a transformers-compatible configuration for FunASR Paraformer models.
+    """
+    model_type = "paraformer"
+    
+    def __init__(
+        self,
+        vocab_size: int = 8404,
+        encoder_dim: int = 512,
+        attention_heads: int = 4,
+        encoder_layers: int = 50,
+        decoder_layers: int = 16,
+        max_seq_len: int = 512,
+        frontend_conf: Optional[Dict] = None,
+        **kwargs
+    ):
+        if _TRANSFORMERS_AVAILABLE:
+            super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.encoder_dim = encoder_dim
+        self.attention_heads = attention_heads
+        self.encoder_layers = encoder_layers
+        self.decoder_layers = decoder_layers
+        self.max_seq_len = max_seq_len
+        self.frontend_conf = frontend_conf or {}
+    
+    @classmethod
+    def from_funasr_config(cls, config_path: Union[str, Path]) -> "ParaformerConfig":
+        """Load configuration from FunASR config.yaml file."""
+        try:
+            if _OMEGACONF_AVAILABLE:
+                config = OmegaConf.load(config_path)
+                
+                return cls(
+                    vocab_size=config.get("vocab_size", 8404),
+                    encoder_dim=config.get("encoder_conf", {}).get("output_size", 512),
+                    attention_heads=config.get("encoder_conf", {}).get("attention_heads", 4),
+                    encoder_layers=config.get("encoder_conf", {}).get("num_blocks", 50),
+                    decoder_layers=config.get("decoder_conf", {}).get("num_blocks", 16),
+                    max_seq_len=config.get("max_seq_len", 512),
+                    frontend_conf=dict(config.get("frontend_conf", {})),
+                )
+        except Exception as e:
+            logging.warning(f"Could not load FunASR config: {e}, using defaults")
+        return cls()
+
+
+class ParaformerForASR(PreTrainedModel):
+    """
+    Transformers-compatible wrapper for Paraformer ASR models.
+    
+    This class wraps FunASR Paraformer models to make them compatible with
+    the optimum-intel export pipeline.
+    """
+    if _TRANSFORMERS_AVAILABLE:
+        config_class = ParaformerConfig
+    base_model_prefix = "paraformer"
+    main_input_name = "speech"
+    
+    def __init__(self, config: ParaformerConfig, funasr_model=None):
+        if _TRANSFORMERS_AVAILABLE:
+            super().__init__(config)
+        self.config = config
+        self.funasr_model = funasr_model
+        self._jit_model = None
+        self._model_path = None
+        self._model_kwargs = {}
+    
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name_or_path: Union[str, Path],
+        *model_args,
+        cache_dir: Optional[str] = None,
+        **kwargs
+    ) -> "ParaformerForASR":
+        """
+        Load a Paraformer model from a FunASR model directory or HuggingFace Hub.
+        """
+        from huggingface_hub import snapshot_download
+        
+        model_path = Path(model_name_or_path)
+        
+        # Download from HuggingFace Hub if not a local path
+        if not model_path.exists():
+            logging.info(f"Downloading Paraformer model from HuggingFace Hub: {model_name_or_path}")
+            model_path = Path(snapshot_download(
+                repo_id=str(model_name_or_path),
+                cache_dir=cache_dir,
+                token=kwargs.get("token"),
+                revision=kwargs.get("revision", "main"),
+            ))
+        
+        # Load config
+        config_yaml_path = model_path / "config.yaml"
+        if config_yaml_path.exists():
+            config = ParaformerConfig.from_funasr_config(config_yaml_path)
+        else:
+            config = ParaformerConfig()
+        
+        # Load the FunASR model
+        device = kwargs.get("device", "cpu")
+        funasr_model, model_kwargs = build_model(model=str(model_path), device=device)
+        
+        instance = cls(config, funasr_model=funasr_model)
+        instance._model_path = model_path
+        instance._model_kwargs = model_kwargs
+        
+        return instance
+    
+    def get_jit_model(self) -> torch.jit.ScriptModule:
+        """Get or create the TorchScript model for export."""
+        if self._jit_model is None:
+            _, self._jit_model = export(
+                self.funasr_model,
+                self._model_kwargs,
+                type="torchscript",
+                quantize=False,
+                device=str(self._model_kwargs.get("device", "cpu"))
+            )
+        return self._jit_model
+    
+    def forward(self, speech: torch.Tensor, speech_lengths: torch.Tensor):
+        """Forward pass through the model."""
+        if self.funasr_model is not None:
+            return self.funasr_model(speech, speech_lengths)
+        raise ValueError("FunASR model not loaded")
+
+
+def _load_paraformer_model(
+    model_name_or_path: str,
+    subfolder: str = "",
+    revision: str = "main",
+    cache_dir: str = None,
+    token: Optional[str] = None,
+    trust_remote_code: bool = False,
+    **kwargs,
+):
+    """Load a Paraformer model for export (TasksManager compatible loader)."""
+    return ParaformerForASR.from_pretrained(
+        model_name_or_path,
+        cache_dir=cache_dir,
+        token=token,
+        revision=revision,
+        **kwargs,
+    )

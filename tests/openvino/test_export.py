@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 import unittest
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from optimum.intel import (
     OVModelForSpeechSeq2Seq,
     OVModelForTextToSpeechSeq2Seq,
     OVModelForTokenClassification,
+    OVParaformerForSpeechSeq2Seq,
     OVModelForVisualCausalLM,
     OVModelForZeroShotImageClassification,
     OVSamModel,
@@ -86,6 +88,10 @@ class ExportModelTest(unittest.TestCase):
         "flux": OVFluxPipeline,
         "ltx-video": OVLTXPipeline,
     }
+
+    # Paraformer uses a full-size model, only run when explicitly enabled
+    if os.environ.get("RUN_SLOW_EXPORT_TESTS") == "1":
+        SUPPORTED_ARCHITECTURES["paraformer"] = OVParaformerForSpeechSeq2Seq
 
     if is_transformers_version(">=", "4.49"):
         SUPPORTED_ARCHITECTURES.update({"zamba2": OVModelForCausalLM})

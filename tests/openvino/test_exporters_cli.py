@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -114,6 +115,10 @@ class OVCLIExportTestCase(unittest.TestCase):
         ("text-to-audio", "speecht5"),
         ("zero-shot-image-classification", "clip"),
     ]
+
+    # Paraformer uses a full-size model, only run when explicitly enabled
+    if os.environ.get("RUN_SLOW_EXPORT_TESTS") == "1":
+        SUPPORTED_ARCHITECTURES.append(("automatic-speech-recognition", "paraformer"))
 
     if is_transformers_version(">=", "4.54.0"):
         SUPPORTED_ARCHITECTURES.extend(

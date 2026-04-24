@@ -7409,3 +7409,28 @@ class GraniteMoeHybridModelPatcher(ModelPatcher):
             else:
                 continue
             mamba_layer.forward = mamba_layer._orig_forward
+
+
+
+class ParaformerModelPatcher(ModelPatcher):
+    """
+    Model patcher for Paraformer ASR models.
+    Applies necessary modifications for export to OpenVINO format.
+    """
+
+    def __enter__(self):
+        super().__enter__()
+
+        try:
+            from .modeling_paraformer import export_rebuild_model
+        except ImportError:
+            logger.warning("Could not import export_rebuild_model from modeling_paraformer")
+            return self
+
+        max_seq_len = self._config.values.get("max_seq_len", 512)
+        export_rebuild_model(self._model, max_seq_len=max_seq_len, device="cpu", type="onnx")
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)

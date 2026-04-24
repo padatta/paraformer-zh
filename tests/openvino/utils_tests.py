@@ -206,6 +206,7 @@ MODEL_NAMES = {
     "wav2vec2-hf": "optimum-intel-internal-testing/tiny-random-Wav2Vec2Model",
     "wav2vec2-conformer": "optimum-intel-internal-testing/tiny-random-wav2vec2-conformer",
     "whisper": "optimum-intel-internal-testing/tiny-random-whisper",
+    **({"paraformer": "funasr/paraformer-zh"} if os.environ.get("RUN_SLOW_EXPORT_TESTS") == "1" else {}),
     "xlm": "optimum-intel-internal-testing/tiny-random-xlm",
     "xlm-roberta": "optimum-intel-internal-testing/tiny-xlm-roberta",
     "xglm": "optimum-intel-internal-testing/tiny-random-XGLMForCausalLM",
@@ -232,6 +233,7 @@ _ARCHITECTURES_TO_EXPECTED_INT8 = {
     "gpt2": {"model": 44},
     "granite-moe-hybrid": {"model": 118},
     "wav2vec2": {"model": 34},
+    **({"paraformer": {"model": 268}} if os.environ.get("RUN_SLOW_EXPORT_TESTS") == "1" else {}),
     "distilbert": {"model": 66},
     "t5": {
         "encoder": 64,
