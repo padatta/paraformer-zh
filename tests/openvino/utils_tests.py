@@ -355,6 +355,9 @@ MODEL_NAMES = {
     "videochat_flash_qwen": "optimum-intel-internal-testing/tiny-videochat-flash-qwen",
 }
 
+if os.environ.get("RUN_SLOW_EXPORT_TESTS") == "1" and is_transformers_version(">=", "5.0"):
+    MODEL_NAMES["lasr_ctc"] = "google/medasr"
+
 EAGLE3_MODELS = {"qwen3_eagle3": ("AngelSlim/Qwen3-1.7B_eagle3", "Qwen/Qwen3-1.7B")}
 
 _ARCHITECTURES_TO_EXPECTED_INT8 = {
@@ -563,6 +566,7 @@ REMOTE_CODE_MODELS = (
     "deepseek",
     "qwen3_eagle3",
     "qwen3_asr",
+    "lasr_ctc",
     "videochat_flash_qwen",
 )
 

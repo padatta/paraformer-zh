@@ -713,6 +713,15 @@ def _main_quantize(
         except (AttributeError, ImportError, KeyError) as e:
             raise RuntimeError(f"Wasn't able to locate OpenVINO class for task {original_task} ({task}).") from e
 
+
+    # For ASR task, detect CTC models (single openvino_model.xml) vs Seq2Seq (encoder/decoder)
+    if task == "automatic-speech-recognition" and model_cls_name == "OVModelForSpeechSeq2Seq":
+        if (Path(output) / "openvino_model.xml").exists() and not (
+            Path(output) / "openvino_encoder_model.xml"
+        ).exists():
+            model_cls_name = "OVModelForCTC"
+            model_cls = getattr(__import__("optimum.intel", fromlist=[model_cls_name]), model_cls_name)
+
     # Step 2. Load the exported model
     model = model_cls.from_pretrained(
         output,
